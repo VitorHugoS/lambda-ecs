@@ -7,6 +7,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 ecs_client = boto3.client('ecs')
+codedeploy_client = boto3.client('codedeploy')
 
 def lambda_handler(event, context):
     try:
@@ -20,6 +21,11 @@ def lambda_handler(event, context):
         if not cluster or not service:
             logger.error("Informações de cluster ou serviço ausentes no evento.")
             return {"status": "Erro", "message": "Evento inválido"}
+        
+        # Verificar se há deployments ativos no serviço
+        if has_active_deployment(cluster, service):
+            logger.warning(f"Serviço {service} tem um deployment ativo. Aguardando conclusão.")
+            return {"status": "Aguardando", "message": "Deployment ativo detectado, sem alterações no momento"}
         
         # Obter a configuração atual do serviço
         response = ecs_client.describe_services(
@@ -57,3 +63,22 @@ def lambda_handler(event, context):
     except Exception as e:
         logger.error(f"Erro ao processar o evento: {str(e)}")
         return {"status": "Erro", "message": str(e)}
+
+def has_active_deployment(cluster, service):
+    """
+    Verifica se há um deployment ativo no serviço ECS associado ao CodeDeploy.
+    """
+    try:
+        response = codedeploy_client.list_deployments(
+            applicationName=f"{cluster}-{service}",
+            deploymentGroupName=f"{service}-deployment-group",
+            includeOnlyStatuses=["Created", "Queued", "InProgress"]
+        )
+        active_deployments = response.get("deployments", [])
+        if active_deployments:
+            logger.info(f"Deployments ativos encontrados para {service}: {active_deployments}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Erro ao verificar deployments ativos: {str(e)}")
+        return False
