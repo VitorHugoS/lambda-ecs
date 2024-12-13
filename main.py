@@ -10,11 +10,38 @@ ecs_client = boto3.client('ecs')
 codedeploy_client = boto3.client('codedeploy')
 
 def lambda_handler(event, context):
+    """
+    Manipula eventos em lote enviados pelo SQS.
+    """
     try:
-        logger.info(f"Evento recebido: {json.dumps(event)}")
+        records = event.get("Records", [])
+        if not records:
+            logger.warning("Nenhuma mensagem encontrada no evento.")
+            return {"status": "OK", "message": "Nenhum evento processado"}
+
+        # Processar cada mensagem
+        results = []
+        for record in records:
+            message = json.loads(record["body"])
+            result = process_message(message)
+            results.append(result)
+        
+        return {"status": "OK", "results": results}
+
+    except Exception as e:
+        logger.error(f"Erro ao processar mensagens: {str(e)}")
+        return {"status": "Erro", "message": str(e)}
+
+
+def process_message(message):
+    """
+    Processa uma única mensagem do SQS.
+    """
+    try:
+        logger.info(f"Processando mensagem: {json.dumps(message)}")
         
         # Extrair informações do evento
-        detail = event.get("detail", {})
+        detail = message.get("detail", {})
         cluster = detail.get("clusterArn", "").split("/")[-1]
         service = detail.get("group", "").replace("service:", "")
         
@@ -22,12 +49,12 @@ def lambda_handler(event, context):
             logger.error("Informações de cluster ou serviço ausentes no evento.")
             return {"status": "Erro", "message": "Evento inválido"}
         
-        # Verificar se há deployments ativos no serviço
+        # Verificar se há deployments ativos
         if has_active_deployment(cluster, service):
             logger.warning(f"Serviço {service} tem um deployment ativo. Aguardando conclusão.")
-            return {"status": "Aguardando", "message": "Deployment ativo detectado, sem alterações no momento"}
+            return {"status": "Aguardando", "message": "Deployment ativo detectado"}
         
-        # Obter a configuração atual do serviço
+        # Obter configuração do serviço
         response = ecs_client.describe_services(
             cluster=cluster,
             services=[service]
@@ -61,8 +88,9 @@ def lambda_handler(event, context):
         return {"status": "OK", "message": f"Serviço {service} atualizado para FARGATE_SPOT"}
     
     except Exception as e:
-        logger.error(f"Erro ao processar o evento: {str(e)}")
+        logger.error(f"Erro ao processar mensagem: {str(e)}")
         return {"status": "Erro", "message": str(e)}
+
 
 def has_active_deployment(cluster, service):
     """
