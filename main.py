@@ -1,112 +1,43 @@
-import boto3
-import json
-import logging
+# Transformar o DataFrame original em RDD
+rdd1 = df1.rdd
+rdd2 = df2.rdd
 
-# Configuração do logger
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# Criar um dicionário a partir de df2 para consulta eficiente (join manual)
+updates_dict = rdd2.map(lambda row: (row.id, row)).collectAsMap()
 
-ecs_client = boto3.client('ecs')
-codedeploy_client = boto3.client('codedeploy')
+# Broadcast do dicionário para enviar uma única cópia para os executores
+updates_broadcast = spark.sparkContext.broadcast(updates_dict)
 
-def lambda_handler(event, context):
-    """
-    Manipula eventos em lote enviados pelo SQS.
-    """
-    try:
-        records = event.get("Records", [])
-        if not records:
-            logger.warning("Nenhuma mensagem encontrada no evento.")
-            return {"status": "OK", "message": "Nenhum evento processado"}
+# Definir uma função personalizada para aplicar as regras
+def apply_rules(row):
+    # Extrair os valores do dicionário de atualizações
+    updates = updates_broadcast.value
+    id = row.id
+    status = row.status
+    score = row.score
+    category = row.category
 
-        # Processar cada mensagem
-        results = []
-        for record in records:
-            message = json.loads(record["body"])
-            result = process_message(message)
-            results.append(result)
-        
-        return {"status": "OK", "results": results}
+    # Aplicar regras
+    if id in updates:
+        update = updates[id]
+        # Atualizar status
+        if update.new_status and update.is_active:
+            status = update.new_status
+        # Atualizar score
+        if update.new_score and (update.new_score > score or status == "inactive"):
+            score = update.new_score
+        # Atualizar categoria
+        if update.new_category:
+            category = update.new_category
 
-    except Exception as e:
-        logger.error(f"Erro ao processar mensagens: {str(e)}")
-        return {"status": "Erro", "message": str(e)}
+    return (id, status, score, category)
 
+# Aplicar as regras no RDD usando map
+updated_rdd = rdd1.map(apply_rules)
 
-def process_message(message):
-    """
-    Processa uma única mensagem do SQS.
-    """
-    try:
-        logger.info(f"Processando mensagem: {json.dumps(message)}")
-        
-        # Extrair informações do evento
-        detail = message.get("detail", {})
-        cluster = detail.get("clusterArn", "").split("/")[-1]
-        service = detail.get("group", "").replace("service:", "")
-        
-        if not cluster or not service:
-            logger.error("Informações de cluster ou serviço ausentes no evento.")
-            return {"status": "Erro", "message": "Evento inválido"}
-        
-        # Verificar se há deployments ativos
-        if has_active_deployment(cluster, service):
-            logger.warning(f"Serviço {service} tem um deployment ativo. Aguardando conclusão.")
-            return {"status": "Aguardando", "message": "Deployment ativo detectado"}
-        
-        # Obter configuração do serviço
-        response = ecs_client.describe_services(
-            cluster=cluster,
-            services=[service]
-        )
-        services = response.get("services", [])
-        if not services:
-            logger.error(f"Serviço {service} não encontrado no cluster {cluster}.")
-            return {"status": "Erro", "message": "Serviço não encontrado"}
-        
-        service_config = services[0]
-        current_capacity_providers = service_config.get("capacityProviderStrategy", [])
-        
-        # Verificar se já está usando FARGATE_SPOT
-        is_fargate_spot = any(cp.get("capacityProvider") == "FARGATE_SPOT" for cp in current_capacity_providers)
-        
-        if is_fargate_spot:
-            logger.info(f"Serviço {service} já está usando FARGATE_SPOT.")
-            return {"status": "OK", "message": "Sem alterações necessárias"}
-        
-        # Atualizar o serviço para usar FARGATE_SPOT
-        logger.info(f"Atualizando o serviço {service} para usar FARGATE_SPOT.")
-        ecs_client.update_service(
-            cluster=cluster,
-            service=service,
-            capacityProviderStrategy=[
-                {"capacityProvider": "FARGATE_SPOT", "weight": 1}
-            ]
-        )
-        
-        logger.info(f"Serviço {service} atualizado com sucesso.")
-        return {"status": "OK", "message": f"Serviço {service} atualizado para FARGATE_SPOT"}
-    
-    except Exception as e:
-        logger.error(f"Erro ao processar mensagem: {str(e)}")
-        return {"status": "Erro", "message": str(e)}
+# Converter o RDD atualizado de volta para DataFrame
+columns = ["id", "status", "score", "category"]
+df_updated = updated_rdd.toDF(columns)
 
-
-def has_active_deployment(cluster, service):
-    """
-    Verifica se há um deployment ativo no serviço ECS associado ao CodeDeploy.
-    """
-    try:
-        response = codedeploy_client.list_deployments(
-            applicationName=f"{cluster}-{service}",
-            deploymentGroupName=f"{service}-deployment-group",
-            includeOnlyStatuses=["Created", "Queued", "InProgress"]
-        )
-        active_deployments = response.get("deployments", [])
-        if active_deployments:
-            logger.info(f"Deployments ativos encontrados para {service}: {active_deployments}")
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Erro ao verificar deployments ativos: {str(e)}")
-        return False
+# Mostrar o resultado final
+df_updated.show()
